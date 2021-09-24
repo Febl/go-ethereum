@@ -19,6 +19,8 @@ package trie
 import (
 	"errors"
 	"fmt"
+	"github.com/ethereum/go-ethereum/log"
+	"runtime/debug"
 	"sync"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -77,7 +79,15 @@ func (c *committer) Commit(n node, db *Database) (hashNode, int, error) {
 	if db == nil {
 		return nil, 0, errors.New("no db provided")
 	}
+	derefcountA := db.DerefCount()
 	h, committed, err := c.commit(n, db)
+	derefcountB := db.DerefCount()
+	if derefcountA != derefcountB {
+		log.Warn("trie database dereference happened during commit.",
+			"before", derefcountA, "after", derefcountB)
+		log.Warn("Commit ended on error", "err", err)
+		debug.PrintStack()
+	}
 	if err != nil {
 		return nil, 0, err
 	}

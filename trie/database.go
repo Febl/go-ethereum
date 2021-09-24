@@ -23,6 +23,7 @@ import (
 	"reflect"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/VictoriaMetrics/fastcache"
@@ -76,6 +77,7 @@ type Database struct {
 
 	preimages map[common.Hash][]byte // Preimages of nodes from the secure trie
 
+	derefs  uint64             // counter on Dereference operations (accessed atomically)
 	gctime  time.Duration      // Time spent on garbage collection since last commit
 	gcnodes uint64             // Nodes garbage collected since last commit
 	gcsize  common.StorageSize // Data storage garbage collected since last commit
@@ -509,6 +511,10 @@ func (db *Database) reference(child common.Hash, parent common.Hash) {
 	}
 }
 
+func (db *Database) DerefCount() uint64 {
+	return atomic.LoadUint64(&db.derefs)
+}
+
 // Dereference removes an existing reference from a root node.
 func (db *Database) Dereference(root common.Hash) {
 	// Sanity check to ensure that the meta-root is not removed
@@ -518,6 +524,7 @@ func (db *Database) Dereference(root common.Hash) {
 	}
 	db.lock.Lock()
 	defer db.lock.Unlock()
+	atomic.AddUint64(&db.derefs, 1)
 
 	nodes, storage, start := len(db.dirties), db.dirtiesSize, time.Now()
 	db.dereference(root, common.Hash{})
