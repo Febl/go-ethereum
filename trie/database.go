@@ -77,6 +77,8 @@ type Database struct {
 
 	preimages map[common.Hash][]byte // Preimages of nodes from the secure trie
 
+	lastLog time.Time // for peridocal logging
+
 	derefs  uint64             // counter on Dereference operations (accessed atomically)
 	gctime  time.Duration      // Time spent on garbage collection since last commit
 	gcnodes uint64             // Nodes garbage collected since last commit
@@ -537,8 +539,11 @@ func (db *Database) Dereference(root common.Hash) {
 	memcacheGCSizeMeter.Mark(int64(storage - db.dirtiesSize))
 	memcacheGCNodesMeter.Mark(int64(nodes - len(db.dirties)))
 
-	log.Debug("Dereferenced trie from memory database", "nodes", nodes-len(db.dirties), "size", storage-db.dirtiesSize, "time", time.Since(start),
-		"gcnodes", db.gcnodes, "gcsize", db.gcsize, "gctime", db.gctime, "livenodes", len(db.dirties), "livesize", db.dirtiesSize)
+	if time.Since(db.lastLog) > time.Second * 8{
+		log.Info("Dereferenced trie from memory database", "nodes", nodes-len(db.dirties), "size", storage-db.dirtiesSize, "time", time.Since(start),
+			"gcnodes", db.gcnodes, "gcsize", db.gcsize, "gctime", db.gctime, "livenodes", len(db.dirties), "livesize", db.dirtiesSize)
+		db.lastLog = time.Now()
+	}
 }
 
 // dereference is the private locked version of Dereference.

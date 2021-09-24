@@ -41,6 +41,7 @@ func (eth *Ethereum) stateAtBlock(block *types.Block, reexec uint64, base *state
 		database state.Database
 		report   = true
 		origin   = block.NumberU64()
+		root     = block.Root()
 	)
 	// Check the live database first if we have the state fully available, use that.
 	if checkLive {
@@ -49,8 +50,20 @@ func (eth *Ethereum) stateAtBlock(block *types.Block, reexec uint64, base *state
 			return statedb, nil
 		}
 	}
+	// Even if the base is provided, if the state that's being asked for
+	// already exists on disk, we can clean out the ephemeral database and
+	// start from scratch.
+	if ok, _ := eth.chainDb.Has(root[:]); ok {
+		log.Info("State found in diskdb, resetting ephem db", "block", origin, "root", root)
+		// Create a new ephemeral trie.Database for isolating the live one. Otherwise
+		// the internal junks created by tracing will be persisted into the disk.
+		database = state.NewDatabaseWithConfig(eth.chainDb, &trie.Config{Cache: 16})
+		if statedb, err = state.New(block.Root(), database, nil); err == nil {
+			return statedb, nil
+		}
+	}
 	if base != nil {
-		// The optional base statedb is given, mark the start point as parent block
+		// Use the optional base statedb.
 		statedb, database, report = base, base.Database(), false
 		current = eth.blockchain.GetBlock(block.ParentHash(), block.NumberU64()-1)
 	} else {
