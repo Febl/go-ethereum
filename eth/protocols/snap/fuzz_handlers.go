@@ -19,14 +19,32 @@ import (
 	fuzz "github.com/google/gofuzz"
 )
 
+var trieRoot common.Hash
+
 func getChain() *core.BlockChain {
 	db := rawdb.NewMemoryDatabase()
 	//gspec := core.DefaultYoloV2GenesisBlock()
 	ga := make(core.GenesisAlloc, 1000)
 	var a = make([]byte, 20)
+	var mkStorage = func(k, v int) (common.Hash, common.Hash) {
+		var kB = make([]byte, 32)
+		var vB = make([]byte, 32)
+		binary.LittleEndian.PutUint64(kB, uint64(k))
+		binary.LittleEndian.PutUint64(vB, uint64(v))
+		return common.BytesToHash(kB), common.BytesToHash(vB)
+	}
+	storage := make(map[common.Hash]common.Hash)
+	for i := 0; i < 10; i++ {
+		k, v := mkStorage(i, i)
+		storage[k] = v
+	}
 	for i := 0; i < 1000; i++ {
 		binary.LittleEndian.PutUint64(a, uint64(i+0xff))
-		ga[common.BytesToAddress(a)] = core.GenesisAccount{Balance: big.NewInt(int64(i))}
+		acc := core.GenesisAccount{Balance: big.NewInt(int64(i))}
+		if i%2 == 1 {
+			acc.Storage = storage
+		}
+		ga[common.BytesToAddress(a)] = acc
 	}
 	gspec := core.Genesis{
 		Config: params.TestChainConfig,
@@ -44,6 +62,7 @@ func getChain() *core.BlockChain {
 		SnapshotLimit:       100,
 		SnapshotWait:        true,
 	}
+	trieRoot = blocks[len(blocks)-1].Root()
 	bc, _ := core.NewBlockChain(db, cacheConf, gspec.Config, ethash.NewFaker(), vm.Config{}, nil, nil)
 	if _, err := bc.InsertChain(blocks); err != nil {
 		panic(err)
@@ -98,19 +117,28 @@ func doFuzz(input []byte, obj interface{}, code int) int {
 	defer bc.Stop()
 	backend := &dummyBackend{bc}
 	fuzz.NewFromGoFuzz(input).Fuzz(obj)
-	data, _ := rlp.EncodeToBytes(obj)
+	var data []byte
+	switch p := obj.(type) {
+	case *GetTrieNodesPacket:
+		p.Root = trieRoot
+		data, _ = rlp.EncodeToBytes(obj)
+	default:
+		data, _ = rlp.EncodeToBytes(obj)
+	}
 	cli := &dummyRW{
 		code: uint64(code),
 		data: data,
 	}
 	peer := &Peer{id: "lalal", version: 65, rw: cli}
-	// It should only error on decoding failures, which should not happen
-	if err := handleMessage(backend, peer); err != nil {
-		panic(err)
-	}
-	// A response is always to be expected
-	if cli.writeCount != 1 {
+	// Unless an error happens, it should respond
+
+	err := handleMessage(backend, peer)
+	switch {
+	case err == nil && cli.writeCount != 1:
 		panic(fmt.Sprintf("Expected 1 response, got %d", cli.writeCount))
+	case err != nil && cli.writeCount != 0:
+		panic(fmt.Sprintf("Expected 0 response, got %d", cli.writeCount))
+
 	}
 	return 0
 }
