@@ -103,14 +103,7 @@ func NewClientPool(balanceDb ethdb.KeyValueStore, minCap uint64, connectedBias t
 			if c, ok := ns.GetField(node, setup.clientField).(clientPeer); ok {
 				timeout = c.InactiveAllowance()
 			}
-			if timeout > 0 {
-				ns.AddTimeout(node, setup.inactiveFlag, timeout)
-			} else {
-				// Note: if capacity is immediately available then priorityPool will set the active
-				// flag simultaneously with removing the inactive flag and therefore this will not
-				// initiate disconnection
-				ns.SetStateSub(node, nodestate.Flags{}, setup.inactiveFlag, 0)
-			}
+			ns.AddTimeout(node, setup.inactiveFlag, timeout)
 		}
 		if oldState.Equals(setup.inactiveFlag) && newState.Equals(setup.inactiveFlag.Or(setup.priorityFlag)) {
 			ns.SetStateSub(node, setup.inactiveFlag, nodestate.Flags{}, 0) // priority gained; remove timeout
@@ -150,8 +143,10 @@ func NewClientPool(balanceDb ethdb.KeyValueStore, minCap uint64, connectedBias t
 		if oldState.HasAll(cp.setup.activeFlag) && oldState.HasNone(cp.setup.activeFlag) {
 			clientDeactivatedMeter.Mark(1)
 		}
-		_, connected := cp.Active()
-		totalConnectedGauge.Update(int64(connected))
+		activeCount, activeCap := cp.Active()
+		totalActiveCountGauge.Update(int64(activeCount))
+		totalActiveCapacityGauge.Update(int64(activeCap))
+		totalInactiveCountGauge.Update(int64(cp.Inactive()))
 	})
 	return cp
 }
@@ -246,12 +241,11 @@ func (cp *ClientPool) SetCapacity(node *enode.Node, reqCap uint64, bias time.Dur
 			maxTarget = curve.maxCapacity(func(capacity uint64) int64 {
 				return balance.estimatePriority(capacity, 0, 0, bias, false)
 			})
-			if maxTarget <= capacity {
+			if maxTarget < reqCap {
 				return
 			}
-			if maxTarget > reqCap {
-				maxTarget = reqCap
-			}
+			maxTarget = reqCap
+
 			// Specify a narrow target range that allows a limited number of fine step
 			// iterations
 			minTarget = maxTarget - maxTarget/20

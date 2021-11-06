@@ -23,7 +23,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core"
-	"github.com/ethereum/go-ethereum/core/state"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/light"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
@@ -84,6 +84,12 @@ type Backend interface {
 
 // MakeProtocols constructs the P2P protocol definitions for `snap`.
 func MakeProtocols(backend Backend, dnsdisc enode.Iterator) []p2p.Protocol {
+	// Filter the discovery iterator for nodes advertising snap support.
+	dnsdisc = enode.Filter(dnsdisc, func(n *enode.Node) bool {
+		var snap enrEntry
+		return n.Load(&snap) == nil
+	})
+
 	protocols := make([]p2p.Protocol, len(ProtocolVersions))
 	for i, version := range ProtocolVersions {
 		version := version // Closure
@@ -227,6 +233,8 @@ func handleMessage(backend Backend, peer *Peer) error {
 				return fmt.Errorf("accounts not monotonically increasing: #%d [%x] vs #%d [%x]", i-1, res.Accounts[i-1].Hash[:], i, res.Accounts[i].Hash[:])
 			}
 		}
+		requestTracker.Fulfil(peer.id, peer.version, AccountRangeMsg, res.ID)
+
 		return backend.Handle(peer, res)
 
 	case msg.Code == GetStorageRangesMsg:
@@ -311,7 +319,7 @@ func handleMessage(backend Backend, peer *Peer) error {
 				if err != nil {
 					return p2p.Send(peer.rw, StorageRangesMsg, &StorageRangesPacket{ID: req.ID})
 				}
-				var acc state.Account
+				var acc types.StateAccount
 				if err := rlp.DecodeBytes(accTrie.Get(account[:]), &acc); err != nil {
 					return p2p.Send(peer.rw, StorageRangesMsg, &StorageRangesPacket{ID: req.ID})
 				}
@@ -352,7 +360,7 @@ func handleMessage(backend Backend, peer *Peer) error {
 		if err := msg.Decode(res); err != nil {
 			return fmt.Errorf("%w: message %v: %v", errDecode, msg, err)
 		}
-		// Ensure the ranges ae monotonically increasing
+		// Ensure the ranges are monotonically increasing
 		for i, slots := range res.Slots {
 			for j := 1; j < len(slots); j++ {
 				if bytes.Compare(slots[j-1].Hash[:], slots[j].Hash[:]) >= 0 {
@@ -360,6 +368,8 @@ func handleMessage(backend Backend, peer *Peer) error {
 				}
 			}
 		}
+		requestTracker.Fulfil(peer.id, peer.version, StorageRangesMsg, res.ID)
+
 		return backend.Handle(peer, res)
 
 	case msg.Code == GetByteCodesMsg:
@@ -404,6 +414,8 @@ func handleMessage(backend Backend, peer *Peer) error {
 		if err := msg.Decode(res); err != nil {
 			return fmt.Errorf("%w: message %v: %v", errDecode, msg, err)
 		}
+		requestTracker.Fulfil(peer.id, peer.version, ByteCodesMsg, res.ID)
+
 		return backend.Handle(peer, res)
 
 	case msg.Code == GetTrieNodesMsg:
@@ -457,7 +469,7 @@ func handleMessage(backend Backend, peer *Peer) error {
 				// Storage slots requested, open the storage trie and retrieve from there
 				account, err := snap.Account(common.BytesToHash(pathset[0]))
 				loads++ // always account database reads, even for failures
-				if err != nil {
+				if err != nil || account == nil {
 					break
 				}
 				stTrie, err := trie.NewSecure(common.BytesToHash(account.Root), triedb)
@@ -497,6 +509,8 @@ func handleMessage(backend Backend, peer *Peer) error {
 		if err := msg.Decode(res); err != nil {
 			return fmt.Errorf("%w: message %v: %v", errDecode, msg, err)
 		}
+		requestTracker.Fulfil(peer.id, peer.version, TrieNodesMsg, res.ID)
+
 		return backend.Handle(peer, res)
 
 	default:

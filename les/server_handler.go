@@ -27,9 +27,9 @@ import (
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/forkid"
 	"github.com/ethereum/go-ethereum/core/rawdb"
-	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/les/flowcontrol"
 	"github.com/ethereum/go-ethereum/light"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
@@ -41,7 +41,6 @@ import (
 const (
 	softResponseLimit = 2 * 1024 * 1024 // Target maximum size of returned blocks, headers or node data.
 	estHeaderRlpSize  = 500             // Approximate size of an RLP encoded block header
-	ethVersion        = 64              // equivalent eth version for the downloader
 
 	MaxHeaderFetch           = 192 // Amount of block headers to be fetched per retrieval request
 	MaxBodyFetch             = 32  // Amount of block bodies to be fetched per retrieval request
@@ -123,26 +122,27 @@ func (h *serverHandler) handle(p *clientPeer) error {
 		p.Log().Debug("Light Ethereum handshake failed", "err", err)
 		return err
 	}
-
+	// Connected to another server, no messages expected, just wait for disconnection
 	if p.server {
 		if err := h.server.serverset.register(p); err != nil {
 			return err
 		}
-		// connected to another server, no messages expected, just wait for disconnection
 		_, err := p.rw.ReadMsg()
 		h.server.serverset.unregister(p)
 		return err
 	}
-	defer p.fcClient.Disconnect() // set by handshake if it's not another server
+	// Setup flow control mechanism for the peer
+	p.fcClient = flowcontrol.NewClientNode(h.server.fcManager, p.fcParams)
+	defer p.fcClient.Disconnect()
 
-	// Reject light clients if server is not synced.
-	//
-	// Put this checking here, so that "non-synced" les-server peers are still allowed
-	// to keep the connection.
+	// Reject light clients if server is not synced. Put this checking here, so
+	// that "non-synced" les-server peers are still allowed to keep the connection.
 	if !h.synced() {
 		p.Log().Debug("Light server not synced, rejecting peer")
 		return p2p.DiscRequested
 	}
+
+	// Register the peer into the peerset and clientpool
 	if err := h.server.peers.register(p); err != nil {
 		return err
 	}
@@ -151,19 +151,14 @@ func (h *serverHandler) handle(p *clientPeer) error {
 		p.Log().Debug("Client pool already closed")
 		return p2p.DiscRequested
 	}
-	activeCount, _ := h.server.clientPool.Active()
-	clientConnectionGauge.Update(int64(activeCount))
 	p.connectedAt = mclock.Now()
 
 	var wg sync.WaitGroup // Wait group used to track all in-flight task routines.
-
 	defer func() {
 		wg.Wait() // Ensure all background task routines have exited.
 		h.server.clientPool.Unregister(p)
 		h.server.peers.unregister(p.ID())
 		p.balance = nil
-		activeCount, _ := h.server.clientPool.Active()
-		clientConnectionGauge.Update(int64(activeCount))
 		connectionTimer.Update(time.Duration(mclock.Now() - p.connectedAt))
 	}()
 
@@ -363,20 +358,20 @@ func (h *serverHandler) AddTxsSync() bool {
 }
 
 // getAccount retrieves an account from the state based on root.
-func getAccount(triedb *trie.Database, root, hash common.Hash) (state.Account, error) {
+func getAccount(triedb *trie.Database, root, hash common.Hash) (types.StateAccount, error) {
 	trie, err := trie.New(root, triedb)
 	if err != nil {
-		return state.Account{}, err
+		return types.StateAccount{}, err
 	}
 	blob, err := trie.TryGet(hash[:])
 	if err != nil {
-		return state.Account{}, err
+		return types.StateAccount{}, err
 	}
-	var account state.Account
-	if err = rlp.DecodeBytes(blob, &account); err != nil {
-		return state.Account{}, err
+	var acc types.StateAccount
+	if err = rlp.DecodeBytes(blob, &acc); err != nil {
+		return types.StateAccount{}, err
 	}
-	return account, nil
+	return acc, nil
 }
 
 // getHelperTrie returns the post-processed trie root for the given trie ID and section index
@@ -412,7 +407,7 @@ func (h *serverHandler) broadcastLoop() {
 	defer headSub.Unsubscribe()
 
 	var (
-		lastHead *types.Header
+		lastHead = h.blockchain.CurrentHeader()
 		lastTd   = common.Big0
 	)
 	for {

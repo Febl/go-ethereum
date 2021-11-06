@@ -17,9 +17,11 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"time"
 
@@ -60,6 +62,7 @@ Remove blockchain and state databases`,
 			dbDeleteCmd,
 			dbPutCmd,
 			dbGetSlotsCmd,
+			dbDumpFreezerIndex,
 		},
 	}
 	dbInspectCmd = cli.Command{
@@ -73,7 +76,6 @@ Remove blockchain and state databases`,
 			utils.RopstenFlag,
 			utils.RinkebyFlag,
 			utils.GoerliFlag,
-			utils.YoloV3Flag,
 		},
 		Usage:       "Inspect the storage size for each type of data in the database",
 		Description: `This commands iterates the entire database. If the optional 'prefix' and 'start' arguments are provided, then the iteration is limited to the given subset of data.`,
@@ -89,7 +91,6 @@ Remove blockchain and state databases`,
 			utils.RopstenFlag,
 			utils.RinkebyFlag,
 			utils.GoerliFlag,
-			utils.YoloV3Flag,
 		},
 	}
 	dbCompactCmd = cli.Command{
@@ -103,7 +104,6 @@ Remove blockchain and state databases`,
 			utils.RopstenFlag,
 			utils.RinkebyFlag,
 			utils.GoerliFlag,
-			utils.YoloV3Flag,
 			utils.CacheFlag,
 			utils.CacheDatabaseFlag,
 		},
@@ -123,7 +123,6 @@ corruption if it is aborted during execution'!`,
 			utils.RopstenFlag,
 			utils.RinkebyFlag,
 			utils.GoerliFlag,
-			utils.YoloV3Flag,
 		},
 		Description: "This command looks up the specified database key from the database.",
 	}
@@ -139,7 +138,6 @@ corruption if it is aborted during execution'!`,
 			utils.RopstenFlag,
 			utils.RinkebyFlag,
 			utils.GoerliFlag,
-			utils.YoloV3Flag,
 		},
 		Description: `This command deletes the specified database key from the database. 
 WARNING: This is a low-level operation which may cause database corruption!`,
@@ -156,7 +154,6 @@ WARNING: This is a low-level operation which may cause database corruption!`,
 			utils.RopstenFlag,
 			utils.RinkebyFlag,
 			utils.GoerliFlag,
-			utils.YoloV3Flag,
 		},
 		Description: `This command sets a given database key to the given value. 
 WARNING: This is a low-level operation which may cause database corruption!`,
@@ -173,9 +170,23 @@ WARNING: This is a low-level operation which may cause database corruption!`,
 			utils.RopstenFlag,
 			utils.RinkebyFlag,
 			utils.GoerliFlag,
-			utils.YoloV3Flag,
 		},
 		Description: "This command looks up the specified database key from the database.",
+	}
+	dbDumpFreezerIndex = cli.Command{
+		Action:    utils.MigrateFlags(freezerInspect),
+		Name:      "freezer-index",
+		Usage:     "Dump out the index of a given freezer type",
+		ArgsUsage: "<type> <start (int)> <end (int)>",
+		Flags: []cli.Flag{
+			utils.DataDirFlag,
+			utils.SyncModeFlag,
+			utils.MainnetFlag,
+			utils.RopstenFlag,
+			utils.RinkebyFlag,
+			utils.GoerliFlag,
+		},
+		Description: "This command displays information about the freezer index.",
 	}
 )
 
@@ -325,14 +336,15 @@ func dbGet(ctx *cli.Context) error {
 	db := utils.MakeChainDatabase(ctx, stack, true)
 	defer db.Close()
 
-	key, err := hexutil.Decode(ctx.Args().Get(0))
+	key, err := parseHexOrString(ctx.Args().Get(0))
 	if err != nil {
 		log.Info("Could not decode the key", "error", err)
 		return err
 	}
+
 	data, err := db.Get(key)
 	if err != nil {
-		log.Info("Get operation failed", "error", err)
+		log.Info("Get operation failed", "key", fmt.Sprintf("0x%#x", key), "error", err)
 		return err
 	}
 	fmt.Printf("key %#x: %#x\n", key, data)
@@ -350,7 +362,7 @@ func dbDelete(ctx *cli.Context) error {
 	db := utils.MakeChainDatabase(ctx, stack, false)
 	defer db.Close()
 
-	key, err := hexutil.Decode(ctx.Args().Get(0))
+	key, err := parseHexOrString(ctx.Args().Get(0))
 	if err != nil {
 		log.Info("Could not decode the key", "error", err)
 		return err
@@ -360,7 +372,7 @@ func dbDelete(ctx *cli.Context) error {
 		fmt.Printf("Previous value: %#x\n", data)
 	}
 	if err = db.Delete(key); err != nil {
-		log.Info("Delete operation returned an error", "error", err)
+		log.Info("Delete operation returned an error", "key", fmt.Sprintf("0x%#x", key), "error", err)
 		return err
 	}
 	return nil
@@ -383,7 +395,7 @@ func dbPut(ctx *cli.Context) error {
 		data  []byte
 		err   error
 	)
-	key, err = hexutil.Decode(ctx.Args().Get(0))
+	key, err = parseHexOrString(ctx.Args().Get(0))
 	if err != nil {
 		log.Info("Could not decode the key", "error", err)
 		return err
@@ -448,4 +460,53 @@ func dbDumpTrie(ctx *cli.Context) error {
 		count++
 	}
 	return it.Err
+}
+
+func freezerInspect(ctx *cli.Context) error {
+	var (
+		start, end    int64
+		disableSnappy bool
+		err           error
+	)
+	if ctx.NArg() < 3 {
+		return fmt.Errorf("required arguments: %v", ctx.Command.ArgsUsage)
+	}
+	kind := ctx.Args().Get(0)
+	if noSnap, ok := rawdb.FreezerNoSnappy[kind]; !ok {
+		var options []string
+		for opt := range rawdb.FreezerNoSnappy {
+			options = append(options, opt)
+		}
+		sort.Strings(options)
+		return fmt.Errorf("Could read freezer-type '%v'. Available options: %v", kind, options)
+	} else {
+		disableSnappy = noSnap
+	}
+	if start, err = strconv.ParseInt(ctx.Args().Get(1), 10, 64); err != nil {
+		log.Info("Could read start-param", "error", err)
+		return err
+	}
+	if end, err = strconv.ParseInt(ctx.Args().Get(2), 10, 64); err != nil {
+		log.Info("Could read count param", "error", err)
+		return err
+	}
+	stack, _ := makeConfigNode(ctx)
+	defer stack.Close()
+	path := filepath.Join(stack.ResolvePath("chaindata"), "ancient")
+	log.Info("Opening freezer", "location", path, "name", kind)
+	if f, err := rawdb.NewFreezerTable(path, kind, disableSnappy); err != nil {
+		return err
+	} else {
+		f.DumpIndex(start, end)
+	}
+	return nil
+}
+
+// ParseHexOrString tries to hexdecode b, but if the prefix is missing, it instead just returns the raw bytes
+func parseHexOrString(str string) ([]byte, error) {
+	b, err := hexutil.Decode(str)
+	if errors.Is(err, hexutil.ErrMissingPrefix) {
+		return []byte(str), nil
+	}
+	return b, err
 }
